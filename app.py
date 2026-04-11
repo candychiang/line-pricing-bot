@@ -354,8 +354,10 @@ def parse_cargo(text):
     if dims:
         items = []
         for d in dims:
-            vals = sorted([float(d[0]), float(d[1]), float(d[2])], reverse=True)
-            items.append({"l": vals[0], "w": vals[1], "h": vals[2]})
+            # 第三個數字固定為高度，長寬取較大/較小
+            h = float(d[2])
+            lw = sorted([float(d[0]), float(d[1])], reverse=True)
+            items.append({"l": lw[0], "w": lw[1], "h": h})
         result["items"] = items
         result["has_dim"] = True
         # 如果只有一組尺寸但多件，複製到每件
