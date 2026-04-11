@@ -1,4 +1,5 @@
 flask
 line-bot-sdk
 anthropic
-gunicorn
+gspread
+google-auth
