@@ -284,14 +284,14 @@ def calculate_cargo(cargo):
             item_w = items[0]["w"]
             item_h = items[0]["h"]
             express_truck, express_stack = find_best_truck_plt(
-                count, item_l, item_w, item_h, total_kg, user_can_stack, is_express=True)
+                count, item_l, item_w, item_h, result["charge_weight"], user_can_stack, is_express=True)
             combo_truck, combo_stack = find_best_truck_plt(
-                count, item_l, item_w, item_h, total_kg, user_can_stack, is_express=False)
+                count, item_l, item_w, item_h, result["charge_weight"], user_can_stack, is_express=False)
         else:
             express_truck, express_stack = find_best_truck_ctn(
-                items, total_kg, user_can_stack, is_express=True)
+                items, result["charge_weight"], user_can_stack, is_express=True)
             combo_truck, combo_stack = find_best_truck_ctn(
-                items, total_kg, user_can_stack, is_express=False)
+                items, result["charge_weight"], user_can_stack, is_express=False)
         result["express_truck"] = express_truck
         result["combo_truck"] = combo_truck
         result["stackable"] = express_stack
@@ -631,6 +631,7 @@ def handle_message(event):
         except Exception as e:
             print(f"計算錯誤: {e}")
 
+    print(f"[DEBUG] calc_note={calc_note}")
     augmented_msg = user_msg + calc_note
     conversation_history[user_id].append({"role": "user", "content": augmented_msg})
 
