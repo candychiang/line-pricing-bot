@@ -353,7 +353,7 @@ def handle_message(event):
 
     try:
         response = anthropic_client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model="claude-sonnet-4-20250514",
             max_tokens=800,
             system=SYSTEM_PROMPT,
             messages=conversation_history[user_id]
