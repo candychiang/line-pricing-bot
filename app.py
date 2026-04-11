@@ -369,7 +369,7 @@ def parse_cargo(text):
         result["items"] = items
         result["has_dim"] = True
         # 如果只有一組尺寸但多件，複製到每件
-        if len(items) == 1 and result["count"] > 1 and is_pallet:
+        if len(items) == 1 and result["count"] > 1:
             result["items"] = items * result["count"]
     else:
         result["has_dim"] = False
