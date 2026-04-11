@@ -309,6 +309,10 @@ def calculate_cargo(cargo):
 # =====================
 
 def parse_cargo(text):
+    # 中文數字轉阿拉伯數字
+    cn_map = {"一":"1","二":"2","三":"3","四":"4","五":"5","六":"6","七":"7","八":"8","九":"9","十":"10"}
+    for cn, ar in cn_map.items():
+        text = re.sub(cn + r"(?=\s*(件|箱|板|個|PLT|plt|棧板|WDC|wdc|CTN|ctn))", ar, text)
     result = {}
 
     # 件數
