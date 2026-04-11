@@ -183,15 +183,15 @@ def find_best_truck_plt(count, item_l, item_w, item_h, total_kg, user_can_stack,
 def find_best_truck_ctn(items, total_kg, user_can_stack, is_express):
     """
     箱件選車（含多件不同尺寸）：
-    - 底面積加總法，無間距
-    - 單件/多件併車：只看重量+最大件尺寸
-    - 多件專車可疊：面積除以2，高度取最高件×2+7
-    - 多件專車不可疊：面積加總，高度取最高件+7
+    - 箱件無間距
+    - 單件/多件併車：只看最大件尺寸能否放入
+    - 多件專車：用最大件尺寸嘗試所有行列排列，找最小可用車型
+      - 可疊：有效件數減半，高度×2+7≤車斗高
+      - 不可疊：全部平放，高度+7≤車斗高（頭部空間）
     """
     if not items:
         return None, False
 
-    total_area = sum(i["l"] * i["w"] for i in items)
     max_h = max(i["h"] for i in items)
     max_l = max(i["l"] for i in items)
     max_w = max(i["w"] for i in items)
@@ -203,20 +203,28 @@ def find_best_truck_ctn(items, total_kg, user_can_stack, is_express):
             continue
 
         if count == 1 or not is_express:
-            # 單件或併車：只看最大件尺寸+重量
+            # 單件或併車：只看最大件尺寸
             actually_stackable = user_can_stack
             fitted = max_l <= tl and max_w <= tw
         else:
-            # 多件專車
+            # 多件專車：嘗試所有行列排列（箱件無間距）
             actually_stackable = user_can_stack and (max_h * 2 + HEIGHT_GAP <= th)
-            if actually_stackable:
-                effective_area = math.ceil(total_area / 2)
-                need_h = max_h * 2 + HEIGHT_GAP
+            eff = math.ceil(count / 2) if actually_stackable else count
+            need_h = (max_h * 2 + HEIGHT_GAP) if actually_stackable else (max_h + HEIGHT_GAP)
+            if need_h > th:
+                fitted = False
             else:
-                effective_area = total_area
-                need_h = max_h + HEIGHT_GAP
-            truck_area = tl * tw
-            fitted = effective_area <= truck_area and need_h <= th and max_l <= tl and max_w <= tw
+                fitted = False
+                for ol, ow in ([(max_l, max_w), (max_w, max_l)] if max_l != max_w else [(max_l, max_w)]):
+                    for rows in range(1, eff + 1):
+                        cols = math.ceil(eff / rows)
+                        need_l = ol * rows
+                        need_w = ow * cols
+                        if need_l <= tl and need_w <= tw:
+                            fitted = True
+                            break
+                    if fitted:
+                        break
 
         if fitted:
             return truck["name"], actually_stackable
