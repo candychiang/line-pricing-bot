@@ -1,4 +1,3 @@
-
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -1324,13 +1323,12 @@ def handle_message(event):
             # 報價查詢（實重和材積重各查一次取較高）
             truck = calc.get("express_truck")
             if truck:
-                charge_w = calc["charge_weight"]
                 vol_w = calc.get("vol_weight") or 0
 
-                # 用實重查一次
+                # 用計費重查一次（已是MAX(實重,材積重)）
                 combo_p_gw, express_p_gw, addon_gw, area_name, price_note = lookup_price(
-                    user_msg, truck, calc["total_kg"])
-                # 用材積重查一次（有材積重才查）
+                    user_msg, truck, calc["charge_weight"])
+                # 用材積重另外查一次（有材積重才查）
                 if vol_w > 0:
                     combo_p_vw, express_p_vw, _, _, _ = lookup_price(
                         user_msg, truck, vol_w)
@@ -1348,13 +1346,10 @@ def handle_message(event):
                 else:
                     combo_p = combo_p_gw or combo_p_vw
 
-                addon = addon_gw
-
                 # 強制專車但無專車報價 → 請與航線客服確認
                 if calc["force_truck"] and not express_p:
                     lines.append("• 強制專車報價：請與航線客服確認")
                 elif express_p:
-                    # 避免重複顯示相同車型相同金額
                     truck_label = f"• 專車報價（{truck}）：${express_p}"
                     if truck_label not in lines:
                         lines.append(truck_label)
@@ -1363,8 +1358,7 @@ def handle_message(event):
                     combo_label = f"• 併車報價：${combo_p}"
                     if combo_label not in lines:
                         lines.append(combo_label)
-                if addon:
-                    lines.append(f"• 附加費：+${addon}（已含在上方報價中）")
+                # 附加費已含在報價內，不另外顯示
                 if price_note:
                     lines.append(f"• 備註：{price_note}")
                 if area_name:
