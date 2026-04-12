@@ -1,3 +1,4 @@
+
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -306,7 +307,29 @@ def check_missing_info(text):
         return "您好！請問可以提供以下資訊嗎？😊\n• " + "\n• ".join(missing)
 
     # 多地點偵測
-    matched_areas = [kw for kw in LOCATION_KEYWORDS if kw in text]
+    # 縣市層級和地址組成字詞不算獨立地點
+    city_level = ["台北市","新北市","基隆市","桃園市","新竹市","新竹縣",
+                  "苗栗縣","台中市","彰化縣","南投縣","雲林縣","嘉義市",
+                  "嘉義縣","台南市","高雄市","屏東縣","宜蘭縣","花蓮縣",
+                  "台東縣","台北","新北","基隆","桃園","新竹","苗栗",
+                  "台中","彰化","南投","雲林","嘉義","台南","高雄","屏東",
+                  "宜蘭","花蓮","台東"]
+    # 地址組成字（這些出現在地址裡不算地點）
+    addr_chars = ["市","縣","區","路","街","號","巷","弄","樓","段","工業","工業區"]
+
+    # 先移除縣市名稱和地址字詞，再偵測剩下的地點關鍵字
+    text_for_detection = text
+    for city in city_level:
+        text_for_detection = text_for_detection.replace(city, "")
+
+    matched_areas = []
+    for kw in LOCATION_KEYWORDS:
+        # 跳過縣市層級關鍵字
+        if kw in city_level:
+            continue
+        if kw in text_for_detection:
+            matched_areas.append(kw)
+
     unique_areas = list(dict.fromkeys(matched_areas))
     if len(unique_areas) >= 2:
         return "您好！偵測到多個提貨地點，多點詢價請與客服確認，謝謝 😊"
@@ -1329,12 +1352,17 @@ def handle_message(event):
 
                 # 強制專車但無專車報價 → 請與航線客服確認
                 if calc["force_truck"] and not express_p:
-                    lines.append(f"• 強制專車報價：請與航線客服確認")
+                    lines.append("• 強制專車報價：請與航線客服確認")
                 elif express_p:
-                    lines.append(f"• 專車報價（{truck}）：${express_p}")
+                    # 避免重複顯示相同車型相同金額
+                    truck_label = f"• 專車報價（{truck}）：${express_p}"
+                    if truck_label not in lines:
+                        lines.append(truck_label)
 
                 if combo_p and not calc["force_truck"]:
-                    lines.append(f"• 併車報價：${combo_p}")
+                    combo_label = f"• 併車報價：${combo_p}"
+                    if combo_label not in lines:
+                        lines.append(combo_label)
                 if addon:
                     lines.append(f"• 附加費：+${addon}（已含在上方報價中）")
                 if price_note:
