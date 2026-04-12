@@ -1,3 +1,4 @@
+
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -81,10 +82,12 @@ def get_sheet(sheet_name="工作表1"):
 
 # 費率快取（程式啟動時讀取一次）
 _pricing_cache = None
+_kinlian_cache = None
+_detong_cache = None
 
 def load_pricing_from_sheets():
-    """從 Google Sheets 讀取費率表，存入快取"""
-    global _pricing_cache
+    """從 Google Sheets 讀取全部費率表，存入快取"""
+    global _pricing_cache, _kinlian_cache, _detong_cache
     try:
         import json
         scopes = [
@@ -101,55 +104,105 @@ def load_pricing_from_sheets():
         client = gspread.authorize(creds)
         spreadsheet = client.open_by_key(os.environ.get("GOOGLE_SHEET_ID"))
 
-        pricing = {}
+        def read_simple_pricing(sheet_name):
+            """讀取簡單格式費率表（台北/機場）"""
+            pricing = {}
+            try:
+                ws = spreadsheet.worksheet(sheet_name)
+                rows = ws.get_all_values()
+                if len(rows) > 1:
+                    headers = rows[0][1:]
+                    for row in rows[1:]:
+                        if not row[0]: continue
+                        area = row[0].strip()
+                        prices = {}
+                        for i, h in enumerate(headers):
+                            if i+1 < len(row) and row[i+1] and row[i+1] not in ['-','–','']:
+                                try:
+                                    prices[h.strip()] = int(str(row[i+1]).replace(',','').replace('$',''))
+                                except:
+                                    pass
+                        if prices:
+                            pricing[area] = prices
+                print("✅ " + sheet_name + " 讀取成功，" + str(len(pricing)) + " 個地區")
+            except Exception as e:
+                print("❌ " + sheet_name + " 讀取失敗: " + str(e))
+            return pricing
 
-        # 讀取台北費率表
+        # 1. 台北費率
+        taipei = read_simple_pricing("台北費率")
+
+        # 2. 機場費率
+        airport = read_simple_pricing("機場費率")
+
+        # 3. 高雄屏東台南費率（勁連發）
+        kinlian = {}
         try:
-            ws = spreadsheet.worksheet("台北費率")
+            ws = spreadsheet.worksheet("高雄屏東台南費率")
             rows = ws.get_all_values()
             if len(rows) > 1:
-                headers = rows[0][1:]  # 跳過第一欄（地區）
                 for row in rows[1:]:
                     if not row[0]: continue
                     area = row[0].strip()
-                    prices = {}
-                    for i, h in enumerate(headers):
-                        if i+1 < len(row) and row[i+1] and row[i+1] != '-' and row[i+1] != '–':
+                    base = row[1].strip() if len(row) > 1 else ""
+                    addon = int(row[2]) if len(row) > 2 and row[2] else 0
+                    tiers = []
+                    limits = [60, 100, 200, 300, 400, 500, 600]
+                    for i, limit in enumerate(limits):
+                        if i+3 < len(row) and row[i+3]:
                             try:
-                                prices[h.strip()] = int(row[i+1].replace(',','').replace('$',''))
+                                tiers.append((limit, int(row[i+3])))
                             except:
                                 pass
-                    if prices:
-                        pricing[area] = prices
+                    extra = int(row[10]) if len(row) > 10 and row[10] else 100
+                    kinlian[area] = {"base": base, "addon": addon, "tiers": tiers, "extra": extra}
+            print("✅ 高雄屏東台南費率讀取成功，" + str(len(kinlian)) + " 個地區")
         except Exception as e:
-            print("台北費率讀取失敗: " + str(e))
+            print("❌ 高雄屏東台南費率讀取失敗: " + str(e))
 
-        # 讀取機場費率表
+        # 4. 台中彰化費率（得統得勝）
+        detong = {}
         try:
-            ws = spreadsheet.worksheet("機場費率")
+            ws = spreadsheet.worksheet("台中彰化費率")
             rows = ws.get_all_values()
             if len(rows) > 1:
-                headers = rows[0][1:]
                 for row in rows[1:]:
                     if not row[0]: continue
                     area = row[0].strip()
-                    prices = {}
-                    for i, h in enumerate(headers):
-                        if i+1 < len(row) and row[i+1] and row[i+1] != '-' and row[i+1] != '–':
+                    group = row[1].strip() if len(row) > 1 else ""
+                    tiers = []
+                    limits = [50, 100, 300, 500, 1000]
+                    for i, limit in enumerate(limits):
+                        if i+2 < len(row) and row[i+2]:
                             try:
-                                prices[h.strip()] = int(row[i+1].replace(',','').replace('$',''))
+                                tiers.append((limit, float(row[i+2])))
                             except:
                                 pass
-                    if prices:
-                        pricing[area] = prices
+                    # 1001以上按KG
+                    if len(row) > 7 and row[7]:
+                        try:
+                            tiers.append((99999, float(row[7])))
+                        except:
+                            pass
+                    detong[area] = {"group": group, "tiers": tiers}
+            print("✅ 台中彰化費率讀取成功，" + str(len(detong)) + " 個地區")
         except Exception as e:
-            print("機場費率讀取失敗: " + str(e))
+            print("❌ 台中彰化費率讀取失敗: " + str(e))
 
-        if pricing:
-            _pricing_cache = pricing
-            print("✅ 費率表讀取成功，共 " + str(len(pricing)) + " 個地區")
-        else:
-            print("⚠️ 費率表為空，使用程式內建費率")
+        # 合併台北+機場
+        combined = {}
+        combined.update(taipei)
+        combined.update(airport)
+
+        if combined:
+            _pricing_cache = combined
+        if kinlian:
+            _kinlian_cache = kinlian
+        if detong:
+            _detong_cache = detong
+
+        total = len(combined) + len(kinlian) + len(detong)
+        print("✅ 全部費率讀取完成，共 " + str(total) + " 個地區")
 
     except Exception as e:
         print("費率表讀取失敗，使用程式內建費率: " + str(e))
@@ -728,7 +781,20 @@ def lookup_price(user_msg, truck_type, charge_weight):
     # 勁連發
     for kw, area_key in KINLIAN_KEYWORDS:
         if kw in user_msg:
-            # 附加費地區查對應基本價再加附加費
+            # 優先使用 Sheets 快取
+            if _kinlian_cache and kw in _kinlian_cache:
+                data = _kinlian_cache[kw]
+                tiers = data["tiers"]
+                addon = data["addon"]
+                price = None
+                for limit, p in tiers:
+                    if charge_weight <= limit:
+                        price = p; break
+                if price is None and tiers:
+                    over = charge_weight - 600
+                    price = tiers[-1][1] + (int(over/100)+(1 if over%100>0 else 0))*data.get("extra",100)
+                return (price+addon if price else None), None, addon, kw, "勁連發（僅併車）"
+            # 使用程式內建費率
             if area_key in ["麻豆","佳里","七股","將軍","山上"]:
                 base_key = "台南"
             elif area_key in ["林園","大樹"]:
@@ -749,6 +815,16 @@ def lookup_price(user_msg, truck_type, charge_weight):
     # 得統得勝
     for kw, area_key in DETONG_KEYWORDS:
         if kw in user_msg:
+            # 優先使用 Sheets 快取
+            if _detong_cache and kw in _detong_cache:
+                data = _detong_cache[kw]
+                tiers = data["tiers"]
+                price = None
+                for limit, p in tiers:
+                    if charge_weight <= limit:
+                        price = round(charge_weight * p) if p < 10 else int(p); break
+                return price, None, 0, kw, "得統得勝（僅按重量）"
+            # 使用程式內建費率
             tiers = DETONG_PRICE.get(area_key)
             price = None
             for limit, p in tiers:
@@ -761,7 +837,9 @@ def lookup_price(user_msg, truck_type, charge_weight):
         if kw in user_msg:
             if mapped == "無報價":
                 return None, None, 0, kw, "此地區無報價，請洽客服確認"
-            prices = PRICING_DB.get(mapped, {})
+            # 優先使用 Sheets 快取，再用程式內建
+            db = get_pricing_db()
+            prices = db.get(mapped, {})
             return prices.get("併車"), prices.get(truck_type), 0, mapped, ""
 
     return None, None, 0, None, "此地區無報價，請洽客服確認"
