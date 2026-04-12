@@ -53,19 +53,115 @@ WELCOME_MSG = """您好！我是空運出口卡車費助理 🐼
 # Google Sheets
 # =====================
 
-def get_sheet():
+def get_sheet(sheet_name="工作表1"):
+    """取得指定工作表"""
     try:
+        import json
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive"
         ]
-        creds = Credentials.from_service_account_file(
-            "google_credentials.json", scopes=scopes)
+        # 優先從環境變數讀取憑證
+        creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+        if creds_json:
+            creds_dict = json.loads(creds_json)
+            creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        else:
+            creds = Credentials.from_service_account_file(
+                "google_credentials.json", scopes=scopes)
         client = gspread.authorize(creds)
-        return client.open_by_key(os.environ.get("GOOGLE_SHEET_ID")).sheet1
+        spreadsheet = client.open_by_key(os.environ.get("GOOGLE_SHEET_ID"))
+        try:
+            return spreadsheet.worksheet(sheet_name)
+        except:
+            return spreadsheet.sheet1
     except Exception as e:
-        print(f"Google Sheets 連線失敗: {e}")
+        print("Google Sheets 連線失敗: " + str(e))
         return None
+
+# 費率快取（程式啟動時讀取一次）
+_pricing_cache = None
+
+def load_pricing_from_sheets():
+    """從 Google Sheets 讀取費率表，存入快取"""
+    global _pricing_cache
+    try:
+        import json
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
+        creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+        if creds_json:
+            creds_dict = json.loads(creds_json)
+            creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        else:
+            creds = Credentials.from_service_account_file(
+                "google_credentials.json", scopes=scopes)
+        client = gspread.authorize(creds)
+        spreadsheet = client.open_by_key(os.environ.get("GOOGLE_SHEET_ID"))
+
+        pricing = {}
+
+        # 讀取台北費率表
+        try:
+            ws = spreadsheet.worksheet("台北費率")
+            rows = ws.get_all_values()
+            if len(rows) > 1:
+                headers = rows[0][1:]  # 跳過第一欄（地區）
+                for row in rows[1:]:
+                    if not row[0]: continue
+                    area = row[0].strip()
+                    prices = {}
+                    for i, h in enumerate(headers):
+                        if i+1 < len(row) and row[i+1] and row[i+1] != '-' and row[i+1] != '–':
+                            try:
+                                prices[h.strip()] = int(row[i+1].replace(',','').replace('$',''))
+                            except:
+                                pass
+                    if prices:
+                        pricing[area] = prices
+        except Exception as e:
+            print("台北費率讀取失敗: " + str(e))
+
+        # 讀取機場費率表
+        try:
+            ws = spreadsheet.worksheet("機場費率")
+            rows = ws.get_all_values()
+            if len(rows) > 1:
+                headers = rows[0][1:]
+                for row in rows[1:]:
+                    if not row[0]: continue
+                    area = row[0].strip()
+                    prices = {}
+                    for i, h in enumerate(headers):
+                        if i+1 < len(row) and row[i+1] and row[i+1] != '-' and row[i+1] != '–':
+                            try:
+                                prices[h.strip()] = int(row[i+1].replace(',','').replace('$',''))
+                            except:
+                                pass
+                    if prices:
+                        pricing[area] = prices
+        except Exception as e:
+            print("機場費率讀取失敗: " + str(e))
+
+        if pricing:
+            _pricing_cache = pricing
+            print("✅ 費率表讀取成功，共 " + str(len(pricing)) + " 個地區")
+        else:
+            print("⚠️ 費率表為空，使用程式內建費率")
+
+    except Exception as e:
+        print("費率表讀取失敗，使用程式內建費率: " + str(e))
+
+def get_pricing_db():
+    """取得費率資料（優先使用 Sheets 快取）"""
+    if _pricing_cache:
+        # 合併 Sheets 費率和程式內建費率（Sheets 優先）
+        merged = dict(PRICING_DB)
+        merged.update(_pricing_cache)
+        return merged
+    return PRICING_DB
 
 def log_to_sheet(user_id, display_name, user_msg, ai_reply):
     try:
@@ -840,6 +936,12 @@ WDC=木箱（Wooden Crate）
 def home():
     return "Hello from LINE Truck Bot"
 
+@app.route("/reload-pricing", methods=["GET"])
+def reload_pricing():
+    """手動重新讀取費率表（管理者用）"""
+    load_pricing_from_sheets()
+    return "費率表已重新讀取"
+
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers["X-Line-Signature"]
@@ -1034,5 +1136,7 @@ def handle_message(event):
 
 
 if __name__ == "__main__":
+    # 啟動時讀取費率表
+    load_pricing_from_sheets()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
