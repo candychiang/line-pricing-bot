@@ -145,16 +145,25 @@ def load_pricing_from_sheets():
                     if not row[0]: continue
                     area = row[0].strip()
                     base = row[1].strip() if len(row) > 1 else ""
-                    addon = int(row[2]) if len(row) > 2 and row[2] else 0
+                    try:
+                        addon = int(str(row[2]).replace(',','')) if len(row) > 2 and row[2] else 0
+                    except:
+                        addon = 0
                     tiers = []
+                    # CSV欄位：地區,基本區,附加費,60K以內,61-100K,101-200K,201-300K,301-400K,401-500K,501-600K,每加100K
                     limits = [60, 100, 200, 300, 400, 500, 600]
                     for i, limit in enumerate(limits):
-                        if i+3 < len(row) and row[i+3]:
+                        col = i + 3  # 從第4欄開始（index 3）
+                        if col < len(row) and row[col]:
                             try:
-                                tiers.append((limit, int(row[i+3])))
+                                tiers.append((limit, int(str(row[col]).replace(',',''))))
                             except:
                                 pass
-                    extra = int(row[10]) if len(row) > 10 and row[10] else 100
+                    # 每加100K在第11欄（index 10）
+                    try:
+                        extra = int(str(row[10]).replace(',','')) if len(row) > 10 and row[10] else 100
+                    except:
+                        extra = 100
                     kinlian[area] = {"base": base, "addon": addon, "tiers": tiers, "extra": extra}
             print("✅ 高雄屏東台南費率讀取成功，" + str(len(kinlian)) + " 個地區")
         except Exception as e:
@@ -868,7 +877,9 @@ def lookup_price(user_msg, truck_type, charge_weight):
                 if price is None and tiers:
                     over = charge_weight - 600
                     price = tiers[-1][1] + (int(over/100)+(1 if over%100>0 else 0))*data.get("extra",100)
-                return (price+addon if price else None), None, addon, kw, "勁連發（僅併車）"
+                if price is not None:
+                    return price+addon, None, addon, kw, "勁連發（僅併車）"
+                # price仍然是None → fallback到內建費率
             # 使用程式內建費率
             if area_key in ["麻豆","佳里","七股","將軍","山上"]:
                 base_key = "台南"
