@@ -1019,6 +1019,140 @@ def reload_pricing():
     """手動重新讀取費率表（管理者用）"""
     load_pricing_from_sheets()
     return "費率表已重新讀取"
+@app.route("/run-tests", methods=["GET"])
+def run_tests():
+    """執行自動測試，瀏覽器可直接查看結果"""
+    import math
+    results = []
+    passed = 0
+    failed = 0
+
+    def test(name, actual, expected, tolerance=0):
+        nonlocal passed, failed
+        if tolerance:
+            ok = abs((actual or 0) - expected) <= tolerance
+        else:
+            ok = actual == expected
+        if ok:
+            passed += 1
+            results.append(f"✅ {name}")
+        else:
+            failed += 1
+            results.append(f"❌ {name}：得到 {actual}，預期 {expected}")
+
+    def cbf(l, w, h, count=1):
+        return round(l * w * h / 28317 * count, 1)
+
+    def vw(l, w, h, count=1):
+        return round(l * w * h / 6000 * count, 1)
+
+    def cw(gw, vol_w):
+        return max(gw, vol_w)
+
+    def kinlian_p(base, charge_w, addon=0):
+        tiers = KINLIAN_PRICE.get(base, KINLIAN_PRICE["高市"])
+        p = None
+        for limit, price in tiers:
+            if charge_w <= limit:
+                p = price; break
+        if p is None:
+            over = charge_w - 600
+            p = tiers[-1][1] + (int(over/100)+(1 if over%100>0 else 0))*100
+        return p + addon
+
+    def detong_p(area_key, charge_w):
+        tiers = DETONG_PRICE.get(area_key)
+        if not tiers: return None
+        for limit, p in tiers:
+            if charge_w <= limit:
+                return round(charge_w * p) if p < 10 else int(p)
+        return None
+
+    # 才數計算
+    results.append("\n【1. 才數計算】")
+    test("120×80×90 1件", cbf(120,80,90,1), 30.5)
+    test("127×97×66 1件", cbf(127,97,66,1), 28.7)
+    test("117×85×100 4件", cbf(117,85,100,4), 140.5)
+    test("120×100×140 4件", cbf(120,100,140,4), 237.3)
+
+    # 材積重
+    results.append("\n【2. 材積重（÷6000）】")
+    test("120×80×90 1件", vw(120,80,90,1), 144.0)
+    test("127×97×66 1件", vw(127,97,66,1), 135.6, tolerance=0.5)
+    test("117×85×100 4件", vw(117,85,100,4), 663.0)
+
+    # 計費重
+    results.append("\n【3. 計費重】")
+    test("實重150 材積144 → 150", cw(150,144), 150)
+    test("實重50 材積144 → 144", cw(50,144), 144)
+
+    # 選車（棧板）
+    results.append("\n【4. 選車（棧板）】")
+    truck, stack = find_best_truck_plt(4,117,85,100,843,True,True)
+    test("4PLT 117×85×100 843kg → 3.5T", truck, "3.5T")
+    test("4PLT 不可疊（100×2+7>150）", stack, False)
+    truck, stack = find_best_truck_plt(4,120,100,140,2412,True,True)
+    test("4PLT 120×100×140 2412kg → 4.5T", truck, "4.5T")
+    test("4PLT 不可疊（140×2+7>195）", stack, False)
+    truck, stack = find_best_truck_plt(1,122,102,76,200,True,True)
+    test("1PLT 單件可疊（用戶指定）", stack, True)
+
+    # 選車（箱件）
+    results.append("\n【5. 選車（箱件）】")
+    items3 = [{"l":120,"w":80,"h":90}]*3
+    truck, _ = find_best_truck_ctn(items3, 183, True, True)
+    test("3件 120×80×90 183kg → 1.5T", truck, "1.5T")
+    items4 = [{"l":120,"w":80,"h":90}]*4
+    truck, _ = find_best_truck_ctn(items4, 200, False, True)
+    test("4件 120×80×90 不可疊 200kg → 3.5T", truck, "3.5T")
+
+    # 強制規則
+    results.append("\n【6. 強制規則】")
+    test("高120cm → 強制", 120>=120, True)
+    test("高119cm → 不強制", 119>=120, False)
+    test("重150kg → 強制", 150>=150, True)
+    test("重149kg → 不強制", 149>=150, False)
+
+    # 報價查詢
+    results.append("\n【7. 報價查詢】")
+    db = get_pricing_db()
+    test("台北市區 1.5T", db.get("台北市區",{}).get("1.5T"), 1200)
+    test("基隆 4.5T", db.get("基隆",{}).get("4.5T"), 2800)
+    test("桃園 1.5T", db.get("桃園",{}).get("1.5T"), 1000)
+    test("機場各倉 0.6T", db.get("機場各倉",{}).get("0.6T"), 500)
+    test("機場各倉 無併車", db.get("機場各倉",{}).get("併車"), None)
+
+    # 勁連發
+    results.append("\n【8. 勁連發報價】")
+    test("高雄 50kg → $600", kinlian_p("高市",50), 600)
+    test("高雄 200kg → $900", kinlian_p("高市",200), 900)
+    test("高雄 700kg → $1500", kinlian_p("高市",700), 1500)
+    test("台南 150kg → $1200", kinlian_p("台南",150), 1200)
+    test("佳里 150kg +500 → $1700", kinlian_p("台南",150,500), 1700)
+    test("林園 200kg +200 → $1100", kinlian_p("高市",200,200), 1100)
+
+    # 得統得勝
+    results.append("\n【9. 得統得勝報價】")
+    test("台中 50kg → $400", detong_p("台中",50), 400)
+    test("台中 100kg → $500", detong_p("台中",100), 500)
+    test("台中 1500kg → $1500", detong_p("台中",1500), 1500)
+    test("烏日 80kg → $650", detong_p("烏日",80), 650)
+
+    # 英吋換算
+    results.append("\n【10. 英吋換算】")
+    test("48吋 → 121.9cm", round(48*2.54,1), 121.9)
+    test("32吋 → 81.3cm", round(32*2.54,1), 81.3)
+
+    total = passed + failed
+    summary = f"\n{'='*40}\n測試結果：{passed}/{total} 通過"
+    if failed == 0:
+        summary += "\n🎉 全部通過！"
+    else:
+        summary += f"\n⚠️ {failed} 項失敗，請檢查"
+
+    return "<pre>" + "\n".join(results) + summary + "</pre>"
+
+
 
 @app.route("/callback", methods=["POST"])
 def callback():
