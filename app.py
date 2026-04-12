@@ -13,11 +13,27 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 app = Flask(__name__)
+
+# 管理者 LINE ID（從環境變數讀取）
+ADMIN_LINE_ID = os.environ.get("ADMIN_LINE_ID")
+
+def notify_admin(message):
+    """異常時推播通知管理者"""
+    if not ADMIN_LINE_ID:
+        return
+    try:
+        line_bot_api.push_message(
+            ADMIN_LINE_ID,
+            TextSendMessage(text="⚠️ 熊貓Bot異常通知\n" + str(message))
+        )
+    except Exception as e:
+        print("管理者通知失敗: " + str(e))
 line_bot_api = LineBotApi(os.environ.get("LINE_CHANNEL_ACCESS_TOKEN"))
 handler = WebhookHandler(os.environ.get("LINE_CHANNEL_SECRET"))
 anthropic_client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
 conversation_history = {}
+parse_fail_count = {}  # 解析失敗計數
 
 WELCOME_MSG = """您好！我是空運出口卡車費助理 🐼
 
@@ -61,6 +77,7 @@ def log_to_sheet(user_id, display_name, user_msg, ai_reply):
         sheet.append_row([now, display_name, user_id, user_msg, short_reply])
     except Exception as e:
         print(f"記錄失敗: {e}")
+        notify_admin("Google Sheets記錄失敗\n錯誤:" + str(e)[:200])
 
 def get_display_name(user_id):
     try:
@@ -81,7 +98,15 @@ LOCATION_KEYWORDS = [
     "楠梓", "仁武", "大社", "岡山", "鳳山", "土城", "樹林", "龜山",
     "蘆竹", "大園", "南崁", "竹北", "湖口", "大里", "豐原", "草屯",
     "員林", "鹿港", "永康", "仁德", "關廟", "麻豆", "佳里", "平鎮",
-    "中壢", "八德", "機場", "桃機", "松山機場"
+    "大寮", "小港", "新園", "阿蓮", "萬丹", "內埔", "長治", "路竹",
+    "湖內", "南科", "山上", "林園", "大樹",
+    "林口", "迴龍", "八里", "三峽", "北投", "天母", "社子",
+    "三芝", "金山", "萬里", "鶯歌",
+    "景美", "安坑", "新屋", "楊梅", "觀音", "大溪", "龍潭",
+    "竹南", "香山", "新埔", "苗栗",
+    "中壢", "八德", "潭子", "大雅", "神岡", "大肚", "沙鹿", "后里", "新社",
+    "東勢", "伸港", "花壇", "福興", "秀水", "大村", "芬園", "溪湖", "永靖",
+    "埔鹽", "田中", "埤頭", "北斗", "芳苑", "機場", "桃機", "松山機場"
 ]
 WEIGHT_PATTERN = re.compile(r'(?:GW|G\.?W\.?|gw)\s*:?\s*(\d+(?:\.\d+)?)\s*(?:kg|KGS?)?|(\d+(?:\.\d+)?)\s*(?:kg|公斤|KGS?)', re.IGNORECASE)
 COUNT_PATTERN = re.compile(r'(\d+)\s*(件|箱|個|pcs|pc|ctn|ctns|plt|plts|wdc|pkgs?)', re.IGNORECASE)
@@ -103,6 +128,13 @@ def check_missing_info(text):
         missing.append("件數或重量")
     if missing:
         return "您好！請問可以提供以下資訊嗎？😊\n• " + "\n• ".join(missing)
+
+    # 多地點偵測
+    matched_areas = [kw for kw in LOCATION_KEYWORDS if kw in text]
+    unique_areas = list(dict.fromkeys(matched_areas))
+    if len(unique_areas) >= 2:
+        return "您好！偵測到多個提貨地點，多點詢價請與客服確認，謝謝 😊"
+
     return None
 
 # =====================
@@ -283,10 +315,12 @@ def calculate_cargo(cargo):
             item_l = items[0]["l"]
             item_w = items[0]["w"]
             item_h = items[0]["h"]
+            # 單件棧板：堆疊直接採用用戶指定，不做自動判斷
+            effective_can_stack = user_can_stack if count == 1 else user_can_stack
             express_truck, express_stack = find_best_truck_plt(
-                count, item_l, item_w, item_h, result["charge_weight"], user_can_stack, is_express=True)
+                count, item_l, item_w, item_h, result["charge_weight"], effective_can_stack, is_express=True)
             combo_truck, combo_stack = find_best_truck_plt(
-                count, item_l, item_w, item_h, result["charge_weight"], user_can_stack, is_express=False)
+                count, item_l, item_w, item_h, result["charge_weight"], effective_can_stack, is_express=False)
         else:
             express_truck, express_stack = find_best_truck_ctn(
                 items, result["charge_weight"], user_can_stack, is_express=True)
@@ -309,26 +343,49 @@ def calculate_cargo(cargo):
 # =====================
 
 def parse_cargo(text):
-    # 中文數字轉阿拉伯數字
-    cn_map = {"一":"1","二":"2","三":"3","四":"4","五":"5","六":"6","七":"7","八":"8","九":"9","十":"10"}
-    for cn, ar in cn_map.items():
-        text = re.sub(cn + r"(?=\s*(件|箱|板|個|PLT|plt|棧板|WDC|wdc|CTN|ctn))", ar, text)
-    result = {}
+    """解析業務輸入的貨物資訊，支援多種輸入格式"""
 
-    # 件數
-    count_match = re.search(r'(\d+)\s*(plt|plts|棧板)', text, re.IGNORECASE)
+    # ── 多地點偵測 ──
+    location_count = sum(1 for kw in LOCATION_KEYWORDS if kw in text)
+    # 若出現兩個或以上不同縣市，提示洽客服（由 check_missing_info 處理）
+    result = {}
+    result["multi_location"] = location_count >= 2
+
+    # ── 中文數字轉阿拉伯數字 ──
+    cn_map = {"一":"1","二":"2","三":"3","四":"4","五":"5",
+              "六":"6","七":"7","八":"8","九":"9","十":"10"}
+    for cn, ar in cn_map.items():
+        text = re.sub(cn + r"(?=\s*(件|箱|板|個|PLT|plt|棧板|WDC|wdc|CTN|ctn|pallet|carton))",
+                      ar, text, flags=re.IGNORECASE)
+
+    # ── 公噸換算為 kg（1噸=1000kg）──
+    ton_match = re.search(r'(\d+(?:\.\d+)?)\s*(?:噸|公噸|MT|metric\s*ton)', text, re.IGNORECASE)
+    if ton_match:
+        ton_kg = float(ton_match.group(1)) * 1000
+        text = text[:ton_match.start()] + f"{ton_kg}kg" + text[ton_match.end():]
+
+    # ── 件數解析（擴充棧板/WDC/箱件別名）──
     is_pallet = False
     is_wdc = False
+
+    # 棧板（含 pallet/板 等別名）
+    count_match = re.search(
+        r'(\d+)\s*(plt|plts|pallet|pallets|棧板|板)',
+        text, re.IGNORECASE)
     if count_match:
         result["count"] = int(count_match.group(1))
         is_pallet = True
     else:
-        count_match = re.search(r'(\d+)\s*(wdc)', text, re.IGNORECASE)
+        # WDC 木箱
+        count_match = re.search(r'(\d+)\s*(wdc|wooden\s*crate|木箱)', text, re.IGNORECASE)
         if count_match:
             result["count"] = int(count_match.group(1))
             is_wdc = True
         else:
-            count_match = re.search(r'(\d+)\s*(ctn|ctns|箱|件|個|pcs|pc|pkgs?)', text, re.IGNORECASE)
+            # 一般箱件（含 carton/cartons 等別名）
+            count_match = re.search(
+                r'(\d+)\s*(ctn|ctns|carton|cartons|箱|件|個|pcs|pc|pkgs?|pieces?)',
+                text, re.IGNORECASE)
             if count_match:
                 result["count"] = int(count_match.group(1))
             else:
@@ -337,52 +394,67 @@ def parse_cargo(text):
     result["is_pallet"] = is_pallet
     result["is_wdc"] = is_wdc
 
-    # VW（體積重/才數，用戶已提供）
-    vw_match = re.search(r'V\.?W\.?\s*:?\s*(\d+(?:\.\d+)?)\s*(?:kg|KGS?)?', text, re.IGNORECASE)
-    cbf_match = re.search(r"(\d+(?:\.\d+)?)\s*'", text)  # 33' 這種格式
-    if vw_match:
-        vw_kg = float(vw_match.group(1))
-        result["vol_weight_given"] = vw_kg
-        result["vw_cbf"] = round(vw_kg / 6, 1)
-    elif cbf_match:
-        result["vw_cbf"] = float(cbf_match.group(1))
-    else:
-        result["vw_cbf"] = None
-
-    # 重量（GW優先）
-    gw_match = re.search(r'(?:GW|G\.?W\.?)\s*:?\s*(\d+(?:\.\d+)?)\s*(?:kg|KGS?)?', text, re.IGNORECASE)
+    # ── 重量解析（支援 GW150 / 150K / 150kg / 1.5噸）──
+    # GW 優先
+    gw_match = re.search(
+        r'(?:GW|G\.?W\.?)\s*[:/]?\s*(\d+(?:\.\d+)?)\s*(?:kg|kgs?|公斤|K\b)?',
+        text, re.IGNORECASE)
     if gw_match:
         result["total_kg"] = float(gw_match.group(1))
     else:
-        weight_match = re.search(r'(\d+(?:\.\d+)?)\s*(?:kg|公斤|KGS?)', text, re.IGNORECASE)
+        # 一般重量（含 K 縮寫）
+        weight_match = re.search(
+            r'(\d+(?:\.\d+)?)\s*(?:kg|kgs?|公斤|KGS?|K\b)',
+            text, re.IGNORECASE)
         if weight_match:
             result["total_kg"] = float(weight_match.group(1))
         else:
             return None
 
-    # 尺寸（支援多行多件）
-    dim_pattern = re.compile(r'(\d+(?:\.\d+)?)\s*[×x*Xx\*]\s*(\d+(?:\.\d+)?)\s*[×x*Xx\*]\s*(\d+(?:\.\d+)?)')
+    # ── 尺寸解析（支援 × / x / * / L W H 格式 / 英吋）──
+    # 先嘗試 L/W/H 英文格式
+    lwh_match = re.search(
+        r'L\s*[=:]?\s*(\d+(?:\.\d+)?)\s*[,\s]*W\s*[=:]?\s*(\d+(?:\.\d+)?)\s*[,\s]*H\s*[=:]?\s*(\d+(?:\.\d+)?)',
+        text, re.IGNORECASE)
+
+    # 標準 × 格式
+    dim_pattern = re.compile(
+        r'(\d+(?:\.\d+)?)\s*[×xXx\*]\s*(\d+(?:\.\d+)?)\s*[×xXx\*]\s*(\d+(?:\.\d+)?)')
     dims = dim_pattern.findall(text)
-    if dims:
+
+    # 判斷是否為英吋（含 inch/in/吋 關鍵字）
+    is_inch = bool(re.search(r'inch|吋|\bin\b', text, re.IGNORECASE))
+
+    def to_cm(val):
+        """英吋轉公分"""
+        return round(val * 2.54, 1) if is_inch else val
+
+    if lwh_match:
+        l = to_cm(float(lwh_match.group(1)))
+        w = to_cm(float(lwh_match.group(2)))
+        h = to_cm(float(lwh_match.group(3)))
+        lw = sorted([l, w], reverse=True)
+        items = [{"l": lw[0], "w": lw[1], "h": h}]
+        result["has_dim"] = True
+        result["items"] = items * result["count"] if result["count"] > 1 else items
+    elif dims:
         items = []
         for d in dims:
-            # 第三個數字固定為高度，長寬取較大/較小
-            h = float(d[2])
-            lw = sorted([float(d[0]), float(d[1])], reverse=True)
+            h = to_cm(float(d[2]))
+            lw = sorted([to_cm(float(d[0])), to_cm(float(d[1]))], reverse=True)
             items.append({"l": lw[0], "w": lw[1], "h": h})
-        result["items"] = items
         result["has_dim"] = True
-        # 如果只有一組尺寸但多件，複製到每件
         if len(items) == 1 and result["count"] > 1:
-            result["items"] = items * result["count"]
+            items = items * result["count"]
+        result["items"] = items
     else:
         result["has_dim"] = False
         result["items"] = []
 
-    # 堆疊
+    # ── 堆疊判斷 ──
     result["can_stack"] = "不可疊" not in text and "不可叠" not in text
 
-    # 機場判斷
+    # ── 機場判斷 ──
     result["is_airport"] = bool(re.search(r'機場|桃機|松山機場|CW|EZ|CK', text))
 
     return result
@@ -392,11 +464,24 @@ PRICING_DB = {
     "內湖":     {"併車":450,"0.6T":900,"1.5T":1200,"3.5T":2000,"4.5T":2400,"8.8T":3000,"12T":3500,"15T":4000},
     "南港":     {"併車":450,"0.6T":900,"1.5T":1200,"3.5T":2000,"4.5T":2400,"8.8T":3000,"12T":3500,"15T":4000},
     "汐止":     {"併車":500,"0.6T":1000,"1.5T":1500,"3.5T":2000,"4.5T":2400,"8.8T":2800,"12T":3800,"15T":4000},
-    "深坑":     {"併車":500,"0.6T":1000,"1.5T":1500,"3.5T":2000,"4.5T":2400,"8.8T":2800,"12T":3800,"15T":4000},
+    "深坑":     {"併車":650,"0.6T":1500,"1.5T":1900,"3.5T":2400,"4.5T":3100,"8.8T":3600,"12T":4100,"17T":4600},
+    "安坑":     {"併車":650,"0.6T":1500,"1.5T":1900,"3.5T":2400,"4.5T":3100,"8.8T":3600,"12T":4100,"17T":4600},
     "新店":     {"併車":500,"0.6T":1000,"1.5T":1400,"3.5T":1900,"4.5T":2400,"8.8T":2800,"12T":3500,"15T":3800},
     "永和":     {"併車":500,"0.6T":1000,"1.5T":1400,"3.5T":1900,"4.5T":2400,"8.8T":2800,"12T":3500,"15T":3800},
     "木柵":     {"併車":500,"0.6T":1000,"1.5T":1400,"3.5T":1900,"4.5T":2400,"8.8T":2800,"12T":3500,"15T":3800},
     "板橋":     {"併車":450,"0.6T":900,"1.5T":1300,"3.5T":1800,"4.5T":2400,"8.8T":2600,"12T":3500,"15T":3800},
+    "鶯歌":     {"併車":450,"0.6T":900,"1.5T":1300,"3.5T":1800,"4.5T":2400,"8.8T":2600,"12T":3500,"15T":3800},
+    "景美":     {"併車":500,"0.6T":1000,"1.5T":1400,"3.5T":1900,"4.5T":2400,"8.8T":2800,"12T":3500,"17T":3800},
+    "新屋":     {"0.6T":900,"1.5T":1300,"3.5T":1800,"4.5T":2300,"8.8T":2500,"12T":3200,"17T":3500},
+    "楊梅":     {"0.6T":900,"1.5T":1300,"3.5T":1800,"4.5T":2300,"8.8T":2500,"12T":3200,"17T":3500},
+    "觀音":     {"0.6T":900,"1.5T":1300,"3.5T":1800,"4.5T":2300,"8.8T":2500,"12T":3200,"17T":3500},
+    "迴龍D":    {"0.6T":1000,"1.5T":1300,"3.5T":1800,"4.5T":2300,"8.8T":2500,"12T":3200,"17T":3600},
+    "大溪":     {"0.6T":1000,"1.5T":1300,"3.5T":1800,"4.5T":2300,"8.8T":2500,"12T":3200,"17T":3600},
+    "龍潭":     {"0.6T":1000,"1.5T":1300,"3.5T":1800,"4.5T":2300,"8.8T":2500,"12T":3200,"17T":3600},
+    "竹南":     {"併車":1000,"0.6T":1400,"1.5T":1800,"3.5T":2000,"4.5T":2600,"8.8T":3000,"12T":3800,"17T":4500},
+    "香山":     {"併車":1000,"0.6T":1400,"1.5T":1800,"3.5T":2000,"4.5T":2600,"8.8T":3000,"12T":3800,"17T":4500},
+    "新埔":     {"併車":1000,"0.6T":1400,"1.5T":1800,"3.5T":2000,"4.5T":2600,"8.8T":3000,"12T":3800,"17T":4500},
+    "苗栗":     {"0.6T":2100,"1.5T":2500,"3.5T":3300,"4.5T":4300,"8.8T":4800,"12T":5500,"17T":6500},
     "中和":     {"併車":450,"0.6T":900,"1.5T":1300,"3.5T":1800,"4.5T":2400,"8.8T":2600,"12T":3500,"15T":3800},
     "土城":     {"併車":450,"0.6T":900,"1.5T":1300,"3.5T":1800,"4.5T":2400,"8.8T":2600,"12T":3500,"15T":3800},
     "樹林":     {"併車":450,"0.6T":900,"1.5T":1300,"3.5T":1800,"4.5T":2400,"8.8T":2600,"12T":3500,"15T":3800},
@@ -410,6 +495,16 @@ PRICING_DB = {
     "淡水":     {"併車":900,"0.6T":1300,"1.5T":1800,"3.5T":2300,"4.5T":2800,"8.8T":3200,"12T":3800,"15T":4300},
     "宜蘭":     {"0.6T":3000,"1.5T":3500,"3.5T":4500,"4.5T":5000,"8.8T":6000,"12T":6500,"15T":7500},
     "機場移倉": {"0.6T":350,"1.5T":600,"3.5T":1200,"4.5T":1800,"8.8T":2300,"12T":2500,"15T":2800},
+    "林口":     {"併車":500,"0.6T":900,"1.5T":1300,"3.5T":1800,"4.5T":2300,"8.8T":2500,"12T":3200,"15T":3700},
+    "迴龍":     {"0.6T":1000,"1.5T":1300,"3.5T":1800,"4.5T":2300,"8.8T":2500,"12T":3200,"17T":3600},
+    "八里":     {"併車":500,"0.6T":900,"1.5T":1300,"3.5T":1800,"4.5T":2300,"8.8T":2500,"12T":3200,"15T":3700},
+    "三峽":     {"0.6T":1000,"1.5T":1300,"3.5T":1800,"4.5T":2300,"8.8T":2500,"12T":3200,"17T":3600},
+    "北投":     {"併車":800,"0.6T":1100,"1.5T":1500,"3.5T":2000,"4.5T":2500,"8.8T":3200,"12T":3500,"15T":4000},
+    "天母":     {"併車":800,"0.6T":1100,"1.5T":1500,"3.5T":2000,"4.5T":2500,"8.8T":3200,"12T":3500,"15T":4000},
+    "社子":     {"併車":800,"0.6T":1100,"1.5T":1500,"3.5T":2000,"4.5T":2500,"8.8T":3200,"12T":3500,"15T":4000},
+    "三芝":     {"0.6T":1800,"1.5T":2200,"3.5T":2800,"4.5T":3200,"8.8T":3500,"12T":4000,"15T":4500},
+    "金山":     {"0.6T":1800,"1.5T":2200,"3.5T":2800,"4.5T":3200,"8.8T":3500,"12T":4000,"15T":4500},
+    "萬里":     {"0.6T":1800,"1.5T":2200,"3.5T":2800,"4.5T":3200,"8.8T":3500,"12T":4000,"15T":4500},
     "士林":     {"併車":500,"0.6T":1000,"1.5T":1300,"3.5T":2100,"4.5T":2500,"8.8T":3200,"12T":3600,"17T":4200},
     "北投":     {"併車":500,"0.6T":1000,"1.5T":1300,"3.5T":2100,"4.5T":2500,"8.8T":3200,"12T":3600,"17T":4200},
     "萬華":     {"併車":500,"0.6T":1000,"1.5T":1300,"3.5T":2100,"4.5T":2500,"8.8T":3200,"12T":3600,"17T":4200},
@@ -428,72 +523,123 @@ PRICING_DB = {
 }
 
 AREA_KEYWORDS = [
+    # 基隆/淡水
     ("七堵","基隆"),("基隆","基隆"),("瑞芳","瑞芳"),("淡水","淡水"),
-    ("內湖","內湖"),("南港","南港"),("士林","士林"),("北投","北投"),("萬華","萬華"),
-    ("汐止","汐止"),("深坑","深坑"),
-    ("新店","新店"),("永和","永和"),("木柵","木柵"),
-    ("板橋","板橋"),("中和","中和"),("土城","土城"),("樹林","樹林"),
+    # 台北市區
+    ("內湖","內湖"),("南港","南港"),("士林","士林"),("萬華","萬華"),
+    ("北投","北投"),("天母","天母"),("社子","社子"),
+    # 汐止/深坑
+    ("汐止","汐止"),("深坑","深坑"),("安坑","深坑"),
+    # 新店/永和/木柵/景美
+    ("新店","新店"),("永和","永和"),("木柵","木柵"),("景美","景美"),
+    # 板橋/中和/土城/樹林/鶯歌
+    ("板橋","板橋"),("中和","中和"),("土城","土城"),("樹林","樹林"),("鶯歌","鶯歌"),
+    # 三重/新莊/蘆洲/五股/泰山
     ("三重","三重"),("新莊","新莊"),("蘆洲","蘆洲"),("五股","五股"),("泰山","泰山"),
-    ("林口","無報價"),("八里","無報價"),("三峽","無報價"),
+    # 林口/八里/三峽/迴龍
+    ("林口","林口"),("八里","八里"),("三峽","三峽"),("迴龍","迴龍"),
+    # 三芝/金山/萬里
+    ("三芝","三芝"),("金山","金山"),("萬里","萬里"),
+    # 桃園
     ("桃園","桃園"),("龜山","龜山"),("平鎮","平鎮"),("中壢","中壢"),("八德","八德"),
+    # 蘆竹/大園/南崁
     ("蘆竹","蘆竹"),("大園","大園"),("南崁","南崁"),
+    # 新屋/楊梅/觀音
+    ("新屋","新屋"),("楊梅","楊梅"),("觀音","觀音"),
+    # 迴龍/三峽/大溪/龍潭
+    ("大溪","大溪"),("龍潭","龍潭"),
+    # 新竹/竹北/湖口
     ("新竹","新竹"),("竹北","竹北"),("湖口","湖口"),
+    # 竹南/香山/新埔
+    ("竹南","竹南"),("香山","香山"),("新埔","新埔"),
+    # 苗栗
+    ("苗栗","苗栗"),
+    # 宜蘭
     ("宜蘭","宜蘭"),
+    # 台北（最後比對）
     ("台北","台北市區"),
 ]
 
 KINLIAN_KEYWORDS = [
-    ("左營","高市"),("鼓山","高市"),("前鎮","高市"),("楠梓","高市"),
-    ("仁武","高市"),("大社","高市"),("岡山","高市"),("鳳山","高市"),("路竹","高市"),
-    ("燕巢","高市"),("橋頭","高市"),("梓官","高市"),("湖內","高市"),("高雄","高市"),
+    # 高市組
+    ("高雄","高市"),("大社","高市"),("仁武","高市"),("楠梓","高市"),
+    ("大寮","高市"),("小港","高市"),("前鎮","高市"),("左營","高市"),("鼓山","高市"),
+    # 高市附加
     ("林園","林園"),("大樹","大樹"),
-    ("屏東","屏東"),
-    ("麻豆","麻豆"),("佳里","佳里"),("七股","七股"),("將軍","將軍"),
-    ("永康","台南"),("仁德","台南"),("台南","台南"),
+    # 屏東組
+    ("屏東","屏東"),("新園","屏東"),("橋頭","屏東"),("岡山","屏東"),
+    ("燕巢","屏東"),("梓官","屏東"),("阿蓮","屏東"),("萬丹","屏東"),
+    # 台南組
+    ("台南","台南"),("內埔","台南"),("長治","台南"),("路竹","台南"),
+    ("湖內","台南"),("仁德","台南"),("關廟","台南"),("南科","台南"),("永康","台南"),
+    # 台南附加
+    ("麻豆","麻豆"),("佳里","佳里"),("七股","七股"),("將軍","將軍"),("山上","山上"),
 ]
 
 KINLIAN_PRICE = {
     "高市":  [(60,600),(100,800),(200,900),(300,1100),(400,1200),(500,1300),(600,1400)],
     "屏東":  [(60,800),(100,1000),(200,1100),(300,1300),(400,1400),(500,1500),(600,1600)],
     "台南":  [(60,900),(100,1100),(200,1200),(300,1400),(400,1500),(500,1600),(600,1700)],
-    "麻豆":  [(60,900),(100,1100),(200,1200),(300,1400),(400,1500),(500,1600),(600,1700)],
-    "佳里":  [(60,900),(100,1100),(200,1200),(300,1400),(400,1500),(500,1600),(600,1700)],
-    "七股":  [(60,900),(100,1100),(200,1200),(300,1400),(400,1500),(500,1600),(600,1700)],
-    "將軍":  [(60,900),(100,1100),(200,1200),(300,1400),(400,1500),(500,1600),(600,1700)],
     "林園":  [(60,600),(100,800),(200,900),(300,1100),(400,1200),(500,1300),(600,1400)],
     "大樹":  [(60,600),(100,800),(200,900),(300,1100),(400,1200),(500,1300),(600,1400)],
 }
 
-KINLIAN_ADDON = {"麻豆":500,"佳里":500,"七股":500,"將軍":500,"林園":200,"大樹":200}
+KINLIAN_ADDON = {"麻豆":500,"佳里":500,"七股":500,"將軍":500,"山上":500,"林園":200,"大樹":200}
 
 DETONG_KEYWORDS = [
-    ("大里","台中"),("太平","台中"),("豐原","台中"),
-    ("烏日","烏日"),("梧棲","烏日"),("霧峰","烏日"),("清水","烏日"),("龍井","烏日"),("大甲","烏日"),
-    ("彰化","彰化"),("和美","彰化"),("鹿港","彰化"),
-    ("員林","員林"),("社頭","員林"),
-    ("草屯","草屯"),("南投","草屯"),("南崗","草屯"),
-    ("台中","台中"),
+    # 台中組
+    ("台中","台中"),("大里","台中"),("太平","台中"),("潭子","台中"),
+    ("豐原","台中"),("大雅","台中"),("神岡","台中"),("大肚","台中"),("沙鹿","台中"),
+    # 烏日組
+    ("后里","烏日"),("烏日","烏日"),("梧棲","烏日"),("龍井","烏日"),
+    ("大甲","烏日"),("清水","烏日"),("霧峰","烏日"),("新社","烏日"),
+    # 彰化組
+    ("彰化","彰化"),("東勢","彰化"),("伸港","彰化"),("和美","彰化"),
+    ("鹿港","彰化"),("花壇","彰化"),("福興","彰化"),("秀水","彰化"),
+    # 大村組
+    ("大村","大村"),("芬園","大村"),("員林","大村"),("社頭","大村"),
+    # 溪湖組
+    ("溪湖","溪湖"),("永靖","溪湖"),("埔鹽","溪湖"),("田中","溪湖"),
+    # 埤頭組
+    ("埤頭","埤頭"),("北斗","埤頭"),
+    # 芳苑組
+    ("芳苑","芳苑"),
+    # 草屯組
+    ("草屯","草屯"),("南崗","草屯"),("南投","草屯"),
 ]
 
 DETONG_PRICE = {
     "台中": [(50,400),(100,500),(300,680),(500,880),(1000,1100),(99999,1.0)],
     "烏日": [(50,500),(100,650),(300,800),(500,950),(1000,1350),(99999,1.1)],
     "彰化": [(50,650),(100,800),(300,950),(500,1000),(1000,1400),(99999,1.1)],
-    "員林": [(50,750),(100,850),(300,950),(500,1200),(1000,1500),(99999,1.2)],
+    "大村": [(50,750),(100,850),(300,950),(500,1200),(1000,1500),(99999,1.2)],
+    "溪湖": [(50,800),(100,950),(300,1050),(500,1400),(1000,1600),(99999,1.2)],
+    "埤頭": [(50,850),(100,950),(300,1050),(500,1400),(1000,1700),(99999,1.3)],
+    "芳苑": [(50,900),(100,1000),(300,1100),(500,1500),(1000,1700),(99999,1.3)],
     "草屯": [(50,900),(100,1000),(300,1100),(500,1500),(1000,1800),(99999,1.3)],
 }
 
 def lookup_price(user_msg, truck_type, charge_weight):
-    # 機場
-    if re.search(r'機場|桃機|松山|CW|EZ|CK', user_msg):
-        area_key = "機場移倉" if "松山" in user_msg else "機場各倉"
-        prices = PRICING_DB.get(area_key, {})
-        return None, prices.get(truck_type), 0, area_key, "機場無併車"
+    # 機場（業務只會用到桃園機場各倉）
+    if re.search(r'機場|桃機|CW|EZ|CK', user_msg):
+        area_name = "機場各倉"
+        prices = PRICING_DB.get("機場各倉", {})
+        express_price = prices.get(truck_type)
+        if not express_price:
+            express_price = prices.get("0.6T")
+        return None, express_price, 0, area_name, "機場無併車，請提早通知航線客服"
 
     # 勁連發
     for kw, area_key in KINLIAN_KEYWORDS:
         if kw in user_msg:
-            tiers = KINLIAN_PRICE.get(area_key, KINLIAN_PRICE["高市"])
+            # 附加費地區查對應基本價再加附加費
+            if area_key in ["麻豆","佳里","七股","將軍","山上"]:
+                base_key = "台南"
+            elif area_key in ["林園","大樹"]:
+                base_key = "高市"
+            else:
+                base_key = area_key
+            tiers = KINLIAN_PRICE.get(base_key, KINLIAN_PRICE["高市"])
             price = None
             for limit, p in tiers:
                 if charge_weight <= limit:
@@ -632,22 +778,32 @@ WDC=木箱（Wooden Crate）
 台北市區/內湖/南港→ $450 / $900 / $1200 / $2000 / $2400 / $3000 / $3500 / $4000
 汐止/深坑→ $500 / $1000 / $1500 / $2000 / $2400 / $2800 / $3800 / $4000
 新店/永和/木柵→ $500 / $1000 / $1400 / $1900 / $2400 / $2800 / $3500 / $3800
-板橋/中和/土城/樹林→ $450 / $900 / $1300 / $1800 / $2400 / $2600 / $3500 / $3800
-五股/三重/新莊/蘆洲→ $450 / $800 / $1300 / $1800 / $2300 / $2600 / $3200 / $3700
+板橋/中和/土城/樹林/鶯歌→ $450 / $900 / $1300 / $1800 / $2400 / $2600 / $3500 / $3800
+五股/三重/新莊/蘆洲/泰山→ $450 / $800 / $1300 / $1800 / $2300 / $2600 / $3200 / $3700
 基隆/瑞芳/淡水→ $900 / $1300 / $1800 / $2300 / $2800 / $3200 / $3800 / $4300
+林口/迴龍/八里/三峽→ $500 / $900 / $1300 / $1800 / $2300 / $2500 / $3200 / $3700
+北投/天母/社子→ $800 / $1100 / $1500 / $2000 / $2500 / $3200 / $3500 / $4000
+三芝/金山/萬里→ 無併車 / $1800 / $2200 / $2800 / $3200 / $3500 / $4000 / $4500
 宜蘭→ 無併車 / $3000 / $3500 / $4500 / $5000 / $6000 / $6500 / $7500
-機場移倉→ 無併車 / $350 / $600 / $1200 / $1800 / $2300 / $2500 / $2800
 
 【報價單D 信全運通 台北桃園竹苗 截止14:30】
 車型→ 併車 / 0.6T / 1.5T / 3.5T / 4.5T / 8.8T / 12T / 17T
 台北市區/南港/內湖→ $450 / $900 / $1200 / $2000 / $2400 / $3000 / $3500 / $4000
 士林/萬華→ $500 / $1000 / $1300 / $2100 / $2500 / $3200 / $3600 / $4200
-板橋/中和/永和/樹林/土城→ $450 / $900 / $1300 / $1800 / $2400 / $2600 / $3500 / $3800
+石碑/天母/北投→ $800 / $1100 / $1500 / $2000 / $2500 / $3200 / $3600 / $4000
+景美/新店→ $500 / $1000 / $1400 / $1900 / $2400 / $2800 / $3500 / $3800
+汐止/木柵→ $500 / $1000 / $1500 / $2000 / $2400 / $2800 / $3800 / $4000
+深坑/安坑→ $650 / $1500 / $1900 / $2400 / $3100 / $3600 / $4100 / $4600
+板橋/中和/永和/樹林/土城/鶯歌→ $450 / $900 / $1300 / $1800 / $2400 / $2600 / $3500 / $3800
 三重/蘆洲/新莊/五股/泰山→ $450 / $900 / $1300 / $1800 / $2300 / $2600 / $3200 / $3700
-基隆/淡水/瑞芳→ $900 / $1300 / $1800 / $2300 / $2800 / $3200 / $3800 / $4300
+基隆/淡水/瑞芳/八里/林口→ $900 / $1300 / $1800 / $2300 / $2800 / $3200 / $3800 / $4300
 桃園/龜山/平鎮/中壢/八德→ $450 / $700 / $1000 / $1600 / $2000 / $2200 / $3000 / $3200
 蘆竹/大園/南崁→ $400 / $500 / $800 / $1400 / $1800 / $2000 / $2500 / $3000
+新屋/楊梅/觀音→ 無併車 / $900 / $1300 / $1800 / $2300 / $2500 / $3200 / $3500
+迴龍/三峽/大溪/龍潭→ 無併車 / $1000 / $1300 / $1800 / $2300 / $2500 / $3200 / $3600
 新竹/竹北/湖口→ $800 / $1200 / $1500 / $1800 / $2400 / $2800 / $3500 / $4000
+竹泉/苗林/新埔/香山/竹南→ $1000 / $1400 / $1800 / $2000 / $2600 / $3000 / $3800 / $4500
+苗栗地區→ 無併車 / $2100 / $2500 / $3300 / $4300 / $4800 / $5500 / $6500
 台中→ 無併車 / $4100 / $4600 / $5600 / $6500 / $7500 / $8000 / $8500
 機場各倉→ 無併車 / $500 / $600 / $1200 / $1500 / $2300 / $2500 / $2800
 
@@ -666,14 +822,15 @@ WDC=木箱（Wooden Crate）
 附加費：昇降尾門專車+$500 / 併車+$200 / 林園大樹+$200 / 麻豆佳里七股將軍併車+$500
 
 【報價單B 得統得勝 台中彰化】
-注意：按計費重查表，無專車選項
-計費重/台中市大里太平豐原/烏日梧棲霧峰清水/彰化和美鹿港/員林社頭/草屯南崗：
-1~50kg→ $400 / $500 / $650 / $750 / $900
-51~100kg→ $500 / $650 / $800 / $850 / $1000
-101~300kg→ $680 / $800 / $950 / $950 / $1100
-301~500kg→ $880 / $950 / $1000 / $1200 / $1500
-501~1000kg→ $1100 / $1350 / $1400 / $1500 / $1800
-1001kg以上→ $1/kg / $1.1/kg / $1.1/kg / $1.2/kg / $1.3/kg"""
+注意：無專車，計費重（取實重與材積重較大者）查表，若材積重較高則用材積重查表
+計費重/台中市大里太平潭子豐原大雅神岡大肚沙鹿/后里烏日梧棲龍井大甲清水霧峰新社/彰化市東勢伸港和美鹿港花壇福興秀水/大村芬園員林社頭/溪湖永靖埔鹽田中/埤頭北斗/芳苑/草屯南崗：
+1~50kg→ $400 / $500 / $650 / $750 / $800 / $850 / $900 / $900
+51~100kg→ $500 / $650 / $800 / $850 / $950 / $950 / $1000 / $1000
+101~300kg→ $680 / $800 / $950 / $950 / $1050 / $1050 / $1100 / $1100
+301~500kg→ $880 / $950 / $1000 / $1200 / $1400 / $1400 / $1500 / $1500
+501~1000kg→ $1100 / $1350 / $1400 / $1500 / $1600 / $1700 / $1700 / $1800
+1001kg以上→ $1/kg / $1.1/kg / $1.1/kg / $1.2/kg / $1.2/kg / $1.3/kg / $1.3/kg / $1.3/kg
+專車：請與航線客服確認費用"""
 
 # =====================
 # Routes
@@ -705,7 +862,7 @@ def handle_follow(event):
 def handle_non_text(event):
     line_bot_api.reply_message(
         event.reply_token,
-        TextSendMessage(text="無法處理此類訊息，請輸入文字 😊")
+        TextSendMessage(text="您好！目前無法處理圖片或檔案，請以文字輸入詢價內容，謝謝 😊\n\n範例：\n台北內湖，3件，120×80×90cm，150kg")
     )
 
 @handler.add(MessageEvent, message=AudioMessage)
@@ -735,10 +892,15 @@ def handle_message(event):
     if user_id not in conversation_history:
         conversation_history[user_id] = []
 
+    # 解析失敗計數（連續3次通知管理者）
+    if user_id not in parse_fail_count:
+        parse_fail_count[user_id] = 0
+
     # ★ 程式碼計算
     calc_note = ""
     cargo = parse_cargo(user_msg)
     if cargo:
+        parse_fail_count[user_id] = 0  # 解析成功，重置計數
         try:
             calc = calculate_cargo(cargo)
             lines = ["", "[系統計算結果 - 直接使用以下數據，不需重新計算]"]
@@ -748,6 +910,7 @@ def handle_message(event):
             if calc.get("vol_weight"):
                 lines.append(f"• 材積重：{calc['vol_weight']}kg")
             lines.append(f"• 計費重：{calc['charge_weight']}kg")
+            lines.append(f"• 實重：{cargo['total_kg']}kg")
 
             # 堆疊
             stack_str = "可疊放" if calc.get("stackable") else "不可疊放"
@@ -768,13 +931,41 @@ def handle_message(event):
             if cargo.get("is_airport"):
                 lines.append("• 卸貨地：機場各倉（無併車選項）")
 
-            # 報價查詢
+            # 報價查詢（實重和材積重各查一次取較高）
             truck = calc.get("express_truck")
             if truck:
-                combo_p, express_p, addon, area_name, price_note = lookup_price(
-                    user_msg, truck, calc["charge_weight"])
-                if express_p:
+                charge_w = calc["charge_weight"]
+                vol_w = calc.get("vol_weight") or 0
+
+                # 用實重查一次
+                combo_p_gw, express_p_gw, addon_gw, area_name, price_note = lookup_price(
+                    user_msg, truck, calc["total_kg"])
+                # 用材積重查一次（有材積重才查）
+                if vol_w > 0:
+                    combo_p_vw, express_p_vw, _, _, _ = lookup_price(
+                        user_msg, truck, vol_w)
+                else:
+                    combo_p_vw, express_p_vw = None, None
+
+                # 取較高
+                if express_p_gw and express_p_vw:
+                    express_p = max(express_p_gw, express_p_vw)
+                else:
+                    express_p = express_p_gw or express_p_vw
+
+                if combo_p_gw and combo_p_vw:
+                    combo_p = max(combo_p_gw, combo_p_vw)
+                else:
+                    combo_p = combo_p_gw or combo_p_vw
+
+                addon = addon_gw
+
+                # 強制專車但無專車報價 → 請與航線客服確認
+                if calc["force_truck"] and not express_p:
+                    lines.append(f"• 強制專車報價：請與航線客服確認")
+                elif express_p:
                     lines.append(f"• 專車報價（{truck}）：${express_p}")
+
                 if combo_p and not calc["force_truck"]:
                     lines.append(f"• 併車報價：${combo_p}")
                 if addon:
@@ -784,11 +975,32 @@ def handle_message(event):
                 if area_name:
                     lines.append(f"• 報價地區：{area_name}")
 
+            # 沒有尺寸時的提醒
+            if not cargo.get("has_dim"):
+                lines.append("• ⚠️ 未提供尺寸：才數無法計算，車型僅依重量估算，建議補充尺寸確認")
+                if cargo.get("total_kg"):
+                    # 無尺寸時仍查報價（依實重）
+                    truck_no_dim = "0.6T"  # 預設最小車型，AI再判斷
+                    combo_p2, express_p2, addon2, area2, note2 = lookup_price(
+                        user_msg, truck_no_dim, cargo["total_kg"])
+                    if combo_p2:
+                        lines.append(f"• 依實重併車估價：${combo_p2}（車型需現場確認）")
+                    if note2:
+                        lines.append(f"• 備註：{note2}")
+
             calc_note = "\n".join(lines)
         except Exception as e:
             print(f"計算錯誤: {e}")
+            notify_admin("計算錯誤\n用戶:" + str(display_name) + "\n輸入:" + str(user_msg[:100]) + "\n錯誤:" + str(e)[:200])
 
     print(f"[DEBUG] calc_note={calc_note}")
+    # 解析失敗時計數
+    if not cargo:
+        parse_fail_count[user_id] = parse_fail_count.get(user_id, 0) + 1
+        if parse_fail_count[user_id] >= 3:
+            notify_admin("連續解析失敗3次\n用戶:" + str(display_name) + "(" + str(user_id) + ")\n最後輸入:" + str(user_msg[:100]))
+            parse_fail_count[user_id] = 0
+
     augmented_msg = user_msg + calc_note
     conversation_history[user_id].append({"role": "user", "content": augmented_msg})
 
@@ -815,6 +1027,7 @@ def handle_message(event):
     except Exception as e:
         reply_text = "系統發生錯誤，請稍後再試。"
         print(f"API 錯誤: {e}")
+        notify_admin("API呼叫失敗\n用戶:" + str(display_name) + "\n輸入:" + str(user_msg[:100]) + "\n錯誤:" + str(e)[:200])
 
     log_to_sheet(user_id, display_name, user_msg, reply_text)
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
