@@ -1,4 +1,3 @@
-
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -84,6 +83,7 @@ def get_sheet(sheet_name="工作表1"):
 _pricing_cache = None
 _kinlian_cache = None
 _detong_cache = None
+_english_area_cache = {}  # 英文地名對照表
 
 def load_pricing_from_sheets():
     """從 Google Sheets 讀取全部費率表，存入快取"""
@@ -204,6 +204,23 @@ def load_pricing_from_sheets():
         total = len(combined) + len(kinlian) + len(detong)
         print("✅ 全部費率讀取完成，共 " + str(total) + " 個地區")
 
+        # 5. 英文地名對照表
+        global _english_area_cache
+        try:
+            ws = spreadsheet.worksheet("英文地名對照")
+            rows = ws.get_all_values()
+            eng_map = {}
+            for row in rows[1:]:
+                if len(row) >= 2 and row[0] and row[1]:
+                    eng = row[0].strip()
+                    zh = row[1].strip()
+                    # key 統一去空格小寫
+                    eng_map[eng.replace(" ","").lower()] = zh
+            _english_area_cache = eng_map
+            print("✅ 英文地名對照表讀取成功，共 " + str(len(eng_map)) + " 筆")
+        except Exception as e:
+            print("❌ 英文地名對照表讀取失敗: " + str(e))
+
     except Exception as e:
         print("費率表讀取失敗，使用程式內建費率: " + str(e))
 
@@ -264,7 +281,17 @@ POSTAL_PATTERN = re.compile(r'\b\d{3}\b')
 def has_location(text):
     if POSTAL_PATTERN.search(text):
         return True
-    return any(kw in text for kw in LOCATION_KEYWORDS)
+    if any(kw in text for kw in LOCATION_KEYWORDS):
+        return True
+    # 英文地名識別（忽略空格和大小寫）
+    text_clean = text.replace(" ","").lower()
+    if _english_area_cache:
+        return any(eng in text_clean for eng in _english_area_cache)
+    # 內建英文關鍵字（快取未載入時備用）
+    builtin_eng = ["taipei","taoyuan","kaohsiung","taichung","tainan","keelung",
+                   "hsinchu","neihu","nangang","xizhi","banqiao","zhongli","chungli",
+                   "airport","nantou","yilan","miaoli","changhua","pingtung"]
+    return any(eng in text_clean for eng in builtin_eng)
 
 def has_weight_or_count(text):
     return bool(WEIGHT_PATTERN.search(text)) or bool(COUNT_PATTERN.search(text))
@@ -493,6 +520,32 @@ def calculate_cargo(cargo):
 
 def parse_cargo(text):
     """解析業務輸入的貨物資訊，支援多種輸入格式"""
+
+    # ── 英文地名轉換 ──
+    text_clean_lower = text.replace(" ","").lower()
+    if _english_area_cache:
+        for eng, zh in _english_area_cache.items():
+            if eng in text_clean_lower:
+                # 在原文加入中文地名，讓後續解析可以找到
+                text = text + " " + zh
+                break
+    elif True:
+        # 內建英文對照（快取未載入時備用）
+        builtin_map = {
+            "neihu":"內湖","nangang":"南港","taipei":"台北","taoyuan":"桃園",
+            "kaohsiung":"高雄","taichung":"台中","tainan":"台南","keelung":"基隆",
+            "hsinchu":"新竹","zhongli":"中壢","chungli":"中壢","pingzhen":"平鎮",
+            "guishan":"龜山","zhubei":"竹北","luzhu":"蘆竹","bade":"八德",
+            "xizhi":"汐止","xindian":"新店","banqiao":"板橋","zhonghe":"中和",
+            "sanchong":"三重","xinzhuang":"新莊","luzhou":"蘆洲","wugu":"五股",
+            "linkou":"林口","airport":"機場各倉","cks":"機場各倉","tpe":"機場各倉",
+            "changhua":"彰化","nantou":"南投","pingtung":"屏東","yilan":"宜蘭",
+            "miaoli":"苗栗","kaohsiung":"高雄","tainan":"台南",
+        }
+        for eng, zh in builtin_map.items():
+            if eng in text_clean_lower:
+                text = text + " " + zh
+                break
 
     # ── 多地點偵測 ──
     location_count = sum(1 for kw in LOCATION_KEYWORDS if kw in text)
