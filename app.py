@@ -580,9 +580,9 @@ def parse_cargo(text):
 
     # ── 多地點偵測 ──
     location_count = sum(1 for kw in LOCATION_KEYWORDS if kw in text)
-    # 若出現兩個或以上不同縣市，提示洽客服（由 check_missing_info 處理）
     result = {}
     result["multi_location"] = location_count >= 2
+    result["translated_text"] = text  # 英文地名已轉換成中文的版本
 
     # ── 中文數字轉阿拉伯數字 ──
     cn_map = {"一":"1","二":"2","三":"3","四":"4","五":"5",
@@ -1333,16 +1333,18 @@ def handle_message(event):
 
             # 報價查詢（實重和材積重各查一次取較高）
             truck = calc.get("express_truck")
+            # 使用含中文地名的訊息查報價
+            lookup_msg = cargo.get("translated_text") or user_msg
             if truck:
                 vol_w = calc.get("vol_weight") or 0
 
-                # 用計費重查一次（已是MAX(實重,材積重)）
+                # 用計費重查一次
                 combo_p_gw, express_p_gw, addon_gw, area_name, price_note = lookup_price(
-                    user_msg, truck, calc["charge_weight"])
-                # 用材積重另外查一次（有材積重才查）
+                    lookup_msg, truck, calc["charge_weight"])
+                # 用材積重另外查一次
                 if vol_w > 0:
                     combo_p_vw, express_p_vw, _, _, _ = lookup_price(
-                        user_msg, truck, vol_w)
+                        lookup_msg, truck, vol_w)
                 else:
                     combo_p_vw, express_p_vw = None, None
 
@@ -1382,7 +1384,7 @@ def handle_message(event):
                     # 無尺寸時仍查報價（依實重）
                     truck_no_dim = "0.6T"  # 預設最小車型，AI再判斷
                     combo_p2, express_p2, addon2, area2, note2 = lookup_price(
-                        user_msg, truck_no_dim, cargo["total_kg"])
+                        lookup_msg, truck_no_dim, cargo["total_kg"])
                     if combo_p2:
                         lines.append(f"• 依實重併車估價：${combo_p2}（車型需現場確認）")
                     if note2:
