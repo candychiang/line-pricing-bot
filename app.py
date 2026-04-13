@@ -506,11 +506,11 @@ def calculate_cargo(cargo):
         if item_kg >= 150:
             force_truck = True
             if is_wdc:
-                warnings.append("WDC重≥150kg，強制專車，請確認是否有堆高機或叉車")
+                warnings.append("WDC重≥150kg，強制專車，請確認是否有堆高機或天車")
             else:
-                warnings.append("重≥150kg強制專車，請確認是否有堆高機")
+                warnings.append("重≥150kg強制專車，請確認是否有堆高機或天車")
     elif is_wdc:
-        warnings.append("WDC請確認是否有堆高機或叉車")
+        warnings.append("WDC請確認是否有堆高機或天車")
 
     result["force_truck"] = force_truck
     result["warnings"] = warnings
